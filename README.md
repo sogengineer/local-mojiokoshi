@@ -8,7 +8,7 @@ Audio transcription & meeting notes CLI tool.
 
 - **Whisper (large-v3)**: High-accuracy speech recognition
 - **Two summarization methods**: Choose based on your needs
-- **Apple Silicon optimized**: Runs smoothly on M4 Pro + 48GB RAM
+- **Apple Silicon optimized**: Runs smoothly on M4 Pro
 
 ## Choosing a Summarization Method
 
