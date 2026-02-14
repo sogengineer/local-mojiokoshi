@@ -1,6 +1,17 @@
 ---
 description: 音声ファイルを文字起こしして議事録サマリを作成
 allowed-tools: Bash, Read, Write, Edit, AskUserQuestion
+arguments:
+  - name: audio_file
+    description: 音声ファイルのパス
+    required: true
+  - name: output_file
+    description: 出力ファイルのパス
+    required: true
+  - name: model
+    description: モデルサイズ (tiny/base/small/medium/large-v3)
+    required: false
+    default: small
 ---
 
 # 音声文字起こし & 議事録作成ワークフロー
@@ -9,16 +20,20 @@ allowed-tools: Bash, Read, Write, Edit, AskUserQuestion
 
 - 音声ファイル: $1
 - 出力先: $2
+- モデルサイズ: $3（tiny / base / small / medium / large-v3）
 
 ## 実行手順
 
 1. **入力確認**: 音声ファイルパスと出力先が指定されていない場合は、ユーザーに確認してください。
    - 音声ファイル ($1) が空の場合: 「音声ファイルのパスを入力してください（例: /path/to/audio.m4a）」
    - 出力先 ($2) が空の場合: 「出力ファイルのパスを入力してください（例: /path/to/meeting_notes.md）」
+   - モデルサイズ ($3) が空の場合: デフォルトで `small` を使用（処理速度と精度のバランスが良い）
+     - 高精度が必要な場合は `large-v3` を推奨（ただし処理時間が長くなる）
+     - 素早く結果が欲しい場合は `tiny` または `base` を使用
 
 2. **文字起こし実行**: 以下のコマンドで文字起こしを実行
    ```bash
-   uv run mojiokoshi file <音声ファイル> -o <一時テキストファイル>
+   uv run mojiokoshi file <音声ファイル> -m <モデルサイズ> -o <一時テキストファイル>
    ```
 
 3. **文字起こし結果を読み込み**: 生成されたテキストファイルを読み込む
