@@ -1,5 +1,6 @@
 """Microphone recording module using sounddevice."""
 
+import logging
 from pathlib import Path
 from typing import Callable
 
@@ -7,9 +8,16 @@ import numpy as np
 import sounddevice as sd
 from scipy.io import wavfile
 
+logger = logging.getLogger(__name__)
+
+# 音声フォーマット定数
+INT16_MAX = 32767
+CHUNK_DURATION_SEC = 0.5
+
 
 class MicrophoneRecorder:
-    """Record audio from microphone."""
+    """マイクからの音声録音を管理するクラス。
+    ブロッキング録音とストリーミング録音の両方に対応する。"""
 
     def __init__(
         self,
@@ -25,7 +33,7 @@ class MicrophoneRecorder:
 
     @staticmethod
     def list_devices() -> list[dict]:
-        """List available input devices."""
+        """利用可能な入力デバイスの一覧を取得する"""
         devices = sd.query_devices()
         result = []
         for i, d in enumerate(devices):
@@ -39,9 +47,9 @@ class MicrophoneRecorder:
         return result
 
     def record_blocking(self, duration: float) -> np.ndarray:
-        """Record for a fixed duration (blocking)."""
+        """指定秒数だけ録音して完了を待つ"""
         frames = int(duration * self.sample_rate)
-        print(f"Recording for {duration} seconds...")
+        logger.info("Recording for %s seconds...", duration)
         audio = sd.rec(
             frames,
             samplerate=self.sample_rate,
@@ -50,19 +58,20 @@ class MicrophoneRecorder:
             device=self.device,
         )
         sd.wait()
-        print("Recording complete.")
+        logger.info("Recording complete.")
         return audio.flatten()
 
-    def start_recording(self, on_chunk: Callable[[np.ndarray], None] | None = None):
-        """Start continuous recording (non-blocking)."""
+    def start_recording(self, on_chunk: Callable[[np.ndarray], None] | None = None) -> None:
+        """ストリーミング録音を開始する。チャンクごとにコールバックを呼ぶ。"""
         self._frames = []
 
-        def callback(indata, frames, time, status):
+        def callback(indata, frame_count, time_info, status) -> None:
             if status:
-                print(f"Warning: {status}")
-            self._frames.append(indata.copy())
+                logger.warning("Audio stream status: %s", status)
+            data = indata.copy()
+            self._frames.append(data)
             if on_chunk:
-                on_chunk(indata.copy().flatten())
+                on_chunk(data.flatten())
 
         self._stream = sd.InputStream(
             samplerate=self.sample_rate,
@@ -70,12 +79,12 @@ class MicrophoneRecorder:
             dtype="float32",
             device=self.device,
             callback=callback,
-            blocksize=int(self.sample_rate * 0.5),  # 500ms chunks
+            blocksize=int(self.sample_rate * CHUNK_DURATION_SEC),
         )
         self._stream.start()
 
     def stop_recording(self) -> np.ndarray:
-        """Stop recording and return audio data."""
+        """録音を停止し、蓄積した全音声データを返す"""
         if self._stream:
             self._stream.stop()
             self._stream.close()
@@ -86,7 +95,7 @@ class MicrophoneRecorder:
         return np.array([], dtype=np.float32)
 
     def save_wav(self, audio: np.ndarray, path: Path | str) -> None:
-        """Save audio data as WAV file."""
+        """float32音声をint16に変換してWAVファイルに保存する"""
         path = Path(path)
-        audio_int16 = (audio * 32767).astype(np.int16)
+        audio_int16 = (audio * INT16_MAX).astype(np.int16)
         wavfile.write(path, self.sample_rate, audio_int16)

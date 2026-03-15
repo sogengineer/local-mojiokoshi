@@ -43,6 +43,20 @@ class TestCLI:
         mock_recorder_class.list_devices.assert_called_once()
 
 
+    @patch("mojiokoshi.cli.RealtimeTranscriber")
+    def test_realtime_command(self, mock_rt_class):
+        """Test realtime command creates transcriber and starts."""
+        mock_rt_instance = MagicMock()
+        mock_rt_instance.get_all_text.return_value = ""
+        mock_rt_class.return_value = mock_rt_instance
+
+        with patch("sys.argv", ["mojiokoshi", "realtime"]):
+            main()
+
+        mock_rt_class.assert_called_once()
+        mock_rt_instance.start.assert_called_once()
+
+
 class TestCLIArguments:
     """Tests for CLI argument parsing."""
 
@@ -68,12 +82,19 @@ class TestCLIArguments:
 
     def test_record_duration_option(self):
         """Test record command accepts duration option."""
+        import numpy as np
         with patch("sys.argv", ["mojiokoshi", "record", "-d", "5"]):
-            with patch("mojiokoshi.cli.MicrophoneRecorder") as mock:
-                mock_instance = MagicMock()
-                mock_instance.record_blocking.return_value = MagicMock()
-                mock.return_value = mock_instance
+            with patch("mojiokoshi.cli.MicrophoneRecorder") as mock_rec:
+                with patch("mojiokoshi.cli.WhisperTranscriber") as mock_trans:
+                    mock_instance = MagicMock()
+                    mock_instance.record_blocking.return_value = np.array([0.1], dtype=np.float32)
+                    mock_rec.return_value = mock_instance
 
-                # Will fail at transcription, but argument parsing should work
-                with pytest.raises((SystemExit, Exception)):
+                    mock_trans_instance = MagicMock()
+                    mock_trans_instance.transcribe.return_value = MagicMock(text="test")
+                    mock_trans.return_value = mock_trans_instance
+
+                    # Should complete without error (argument parsing works)
                     main()
+
+                    mock_instance.record_blocking.assert_called_once_with(5.0)

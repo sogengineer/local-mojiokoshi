@@ -1,5 +1,6 @@
 """Realtime transcription with VAD (Voice Activity Detection)."""
 
+import logging
 import tempfile
 import threading
 from pathlib import Path
@@ -8,12 +9,15 @@ from typing import Callable
 import numpy as np
 from scipy.io import wavfile
 
-from .recorder import MicrophoneRecorder
+from .recorder import INT16_MAX, MicrophoneRecorder
 from .transcriber import WhisperTranscriber
+
+logger = logging.getLogger(__name__)
 
 
 class RealtimeTranscriber:
-    """Realtime transcription using VAD-based chunking."""
+    """音声活動検出(VAD)に基づくリアルタイム文字起こしクラス。
+    無音区間を検出して発話単位でWhisperに送る。"""
 
     def __init__(
         self,
@@ -33,111 +37,130 @@ class RealtimeTranscriber:
         self.on_transcription = on_transcription or print
 
         self._buffer: list[np.ndarray] = []
+        self._lock = threading.Lock()
         self._silence_samples = 0
         self._is_speaking = False
-        self._running = False
+        self._stop_event = threading.Event()
         self._transcription_thread: threading.Thread | None = None
         self._all_text: list[str] = []
 
-    def _process_chunk(self, chunk: np.ndarray):
-        """Process audio chunk with simple VAD."""
+    def _process_chunk(self, chunk: np.ndarray) -> None:
+        """音声チャンクのVAD判定を行い、無音が続いたら文字起こしをトリガーする"""
         amplitude = np.abs(chunk).mean()
         is_speech = amplitude > self.silence_threshold
 
-        if is_speech:
-            self._buffer.append(chunk)
-            self._silence_samples = 0
-            self._is_speaking = True
-        else:
-            if self._is_speaking:
+        should_transcribe = False
+        with self._lock:
+            if is_speech:
                 self._buffer.append(chunk)
-                self._silence_samples += len(chunk)
+                self._silence_samples = 0
+                self._is_speaking = True
+            else:
+                if self._is_speaking:
+                    self._buffer.append(chunk)
+                    self._silence_samples += len(chunk)
 
-                # Check if silence duration exceeded
-                samples_threshold = int(self.silence_duration * self.recorder.sample_rate)
-                if self._silence_samples >= samples_threshold:
-                    self._transcribe_buffer()
+                    # 無音が閾値を超えたら発話終了とみなす
+                    samples_threshold = int(self.silence_duration * self.recorder.sample_rate)
+                    if self._silence_samples >= samples_threshold:
+                        should_transcribe = True
 
-    def _transcribe_buffer(self):
-        """Transcribe accumulated buffer."""
-        if not self._buffer:
-            return
+        if should_transcribe:
+            self._transcribe_buffer()
 
-        audio = np.concatenate(self._buffer).flatten()
-        self._buffer = []
-        self._is_speaking = False
-        self._silence_samples = 0
+    def _transcribe_buffer(self) -> None:
+        """バッファに蓄積した音声を別スレッドで文字起こしする"""
+        with self._lock:
+            if not self._buffer:
+                return
 
-        # Check minimum length
+            audio = np.concatenate(self._buffer).flatten()
+            self._buffer = []
+            self._is_speaking = False
+            self._silence_samples = 0
+
+        # 短すぎる音声は無視する
         min_samples = int(self.min_audio_length * self.recorder.sample_rate)
         if len(audio) < min_samples:
             return
 
-        # Transcribe in separate thread to avoid blocking
-        def transcribe():
+        # 前の文字起こしスレッドの完了を待つ（デッドロック防止のためロック外で実行）
+        if self._transcription_thread is not None and self._transcription_thread.is_alive():
+            self._transcription_thread.join(timeout=30)
+
+        # 録音コールバックをブロックしないよう別スレッドで文字起こし
+        def transcribe() -> None:
+            temp_path: Path | None = None
             try:
                 with tempfile.NamedTemporaryFile(suffix=".wav", delete=False) as f:
                     temp_path = Path(f.name)
-                    audio_int16 = (audio * 32767).astype(np.int16)
+                    audio_int16 = (audio * INT16_MAX).astype(np.int16)
                     wavfile.write(temp_path, self.recorder.sample_rate, audio_int16)
 
                 result = self.transcriber.transcribe(temp_path)
-                temp_path.unlink()
 
                 if result.text.strip():
-                    self._all_text.append(result.text.strip())
+                    with self._lock:
+                        self._all_text.append(result.text.strip())
                     self.on_transcription(result.text.strip())
-            except Exception as e:
-                print(f"Transcription error: {e}")
+            except Exception:
+                logger.exception("Transcription error")
+            finally:
+                if temp_path is not None:
+                    temp_path.unlink(missing_ok=True)
 
         self._transcription_thread = threading.Thread(target=transcribe)
         self._transcription_thread.start()
 
-    def start(self):
-        """Start realtime transcription."""
-        print(f"Loading model: {self.transcriber.model_name}...")
-        # Warm up model
+    def start(self) -> None:
+        """リアルタイム文字起こしを開始する（Ctrl+Cで停止）"""
+        logger.info("Loading model: %s...", self.transcriber.model_name)
+        # モデルの初回ロードを事前に行い、最初の文字起こしの遅延を軽減する
         with tempfile.NamedTemporaryFile(suffix=".wav", delete=False) as f:
             temp_path = Path(f.name)
-            silence = np.zeros(16000, dtype=np.int16)
-            wavfile.write(temp_path, 16000, silence)
-            try:
-                self.transcriber.transcribe(temp_path)
-            except Exception:
-                pass
-            temp_path.unlink()
+            silence = np.zeros(self.recorder.sample_rate, dtype=np.int16)
+            wavfile.write(temp_path, self.recorder.sample_rate, silence)
+        try:
+            self.transcriber.transcribe(temp_path)
+        except Exception:
+            logger.warning("Model warmup failed", exc_info=True)
+        finally:
+            temp_path.unlink(missing_ok=True)
 
-        print("\nRealtime transcription started. Press Ctrl+C to stop.\n")
-        print("-" * 50)
+        logger.info("Realtime transcription started. Press Ctrl+C to stop.")
 
-        self._running = True
+        self._stop_event.clear()
         self._all_text = []
         self.recorder.start_recording(on_chunk=self._process_chunk)
 
+        # Ctrl+Cまたはstop_eventが発火するまで待機する
         try:
-            while self._running:
-                threading.Event().wait(0.1)
+            while not self._stop_event.is_set():
+                self._stop_event.wait(0.1)
         except KeyboardInterrupt:
             pass
 
         self.stop()
 
     def stop(self) -> str:
-        """Stop transcription and return all text."""
-        self._running = False
+        """文字起こしを停止し、残りのバッファを処理してから全テキストを返す"""
+        self._stop_event.set()
         self.recorder.stop_recording()
 
-        # Transcribe remaining buffer
-        if self._buffer:
-            self._transcribe_buffer()
+        # 残りのバッファを文字起こし（デッドロック防止のためロック外で実行）
+        self._transcribe_buffer()
 
-        # Wait for last transcription
+        # 最後の文字起こしスレッドの完了を待つ
         if self._transcription_thread:
             self._transcription_thread.join(timeout=30)
+            if self._transcription_thread.is_alive():
+                logger.warning("Transcription thread did not finish in time")
 
-        print("-" * 50)
-        return "\n".join(self._all_text)
+        logger.info("Realtime transcription stopped.")
+        with self._lock:
+            return "\n".join(self._all_text)
 
     def get_all_text(self) -> str:
-        """Get all transcribed text."""
-        return "\n".join(self._all_text)
+        """これまでに文字起こしした全テキストを取得する"""
+        with self._lock:
+            return "\n".join(self._all_text)

@@ -3,6 +3,7 @@
 import argparse
 import sys
 import tempfile
+import time
 from datetime import datetime
 from pathlib import Path
 
@@ -11,11 +12,11 @@ from .realtime import RealtimeTranscriber
 from .transcriber import WhisperTranscriber
 
 
-def cmd_file(args):
-    """Transcribe audio file."""
+def cmd_file(args: argparse.Namespace) -> None:
+    """既存の音声ファイルを文字起こしする"""
     input_path = Path(args.input)
     if not input_path.exists():
-        print(f"Error: File not found: {input_path}")
+        print(f"Error: File not found: {input_path}", file=sys.stderr)
         sys.exit(1)
 
     print(f"Loading model: {args.model}")
@@ -24,7 +25,7 @@ def cmd_file(args):
     print(f"Transcribing: {input_path}")
     result = transcriber.transcribe(input_path)
 
-    # Determine output path
+    # 出力先の決定（指定がなければ入力ファイルと同名の.txt）
     if args.output:
         output_path = Path(args.output)
     else:
@@ -35,11 +36,11 @@ def cmd_file(args):
     print(f"\n--- Result ---\n{result.text}")
 
 
-def cmd_record(args):
-    """Record and transcribe."""
+def cmd_record(args: argparse.Namespace) -> None:
+    """マイクで録音してから文字起こしする"""
     recorder = MicrophoneRecorder(device=args.device)
 
-    # Generate output filename
+    # 出力ファイル名の生成（未指定時はタイムスタンプ付き）
     if args.output:
         output_base = Path(args.output).stem
         output_dir = Path(args.output).parent
@@ -50,7 +51,7 @@ def cmd_record(args):
 
     output_dir.mkdir(parents=True, exist_ok=True)
 
-    # Record
+    # 録音（duration指定時はブロッキング、未指定時はCtrl+Cまで継続）
     if args.duration:
         audio = recorder.record_blocking(args.duration)
     else:
@@ -58,36 +59,41 @@ def cmd_record(args):
         recorder.start_recording()
         try:
             while True:
-                pass
+                time.sleep(0.1)
         except KeyboardInterrupt:
             pass
         audio = recorder.stop_recording()
         print("\nRecording stopped.")
 
     if len(audio) == 0:
-        print("Error: No audio recorded")
+        print("Error: No audio recorded", file=sys.stderr)
         sys.exit(1)
 
-    # Save audio if requested
+    # 要求があればWAVファイルとして保存
     if args.save_audio:
         wav_path = output_dir / f"{output_base}.wav"
         recorder.save_wav(audio, wav_path)
         print(f"Audio saved: {wav_path}")
 
-    # Transcribe
+    # 文字起こし（保存済みWAVがあれば再利用、なければ一時ファイル経由）
     print(f"\nLoading model: {args.model}")
     transcriber = WhisperTranscriber(model_name=args.model, language=args.language)
 
-    # Save to temp file for transcription
-    with tempfile.NamedTemporaryFile(suffix=".wav", delete=False) as f:
-        temp_path = Path(f.name)
-        recorder.save_wav(audio, temp_path)
+    if args.save_audio:
+        print("Transcribing...")
+        result = transcriber.transcribe(wav_path)
+    else:
+        with tempfile.NamedTemporaryFile(suffix=".wav", delete=False) as f:
+            temp_path = Path(f.name)
+            recorder.save_wav(audio, temp_path)
 
-    print("Transcribing...")
-    result = transcriber.transcribe(temp_path)
-    temp_path.unlink()
+        print("Transcribing...")
+        try:
+            result = transcriber.transcribe(temp_path)
+        finally:
+            temp_path.unlink(missing_ok=True)
 
-    # Save result
+    # 結果をテキストファイルに保存
     txt_path = output_dir / f"{output_base}.txt"
     txt_path.write_text(result.text, encoding="utf-8")
 
@@ -95,15 +101,16 @@ def cmd_record(args):
     print(f"\n--- Result ---\n{result.text}")
 
 
-def cmd_realtime(args):
-    """Realtime transcription."""
-    # Generate output filename
+def cmd_realtime(args: argparse.Namespace) -> None:
+    """リアルタイム文字起こしを実行する（VADで発話区間を検出）"""
+    # 出力先の決定
     if args.output:
         output_path = Path(args.output)
     else:
         timestamp = datetime.now().strftime("%Y%m%d_%H%M%S")
         output_path = Path(f"realtime_{timestamp}.txt")
 
+    # 文字起こし結果をリアルタイムに表示するコールバック
     def on_text(text: str):
         print(f">> {text}")
 
@@ -121,14 +128,15 @@ def cmd_realtime(args):
     except KeyboardInterrupt:
         pass
 
+    # 終了後、全テキストをファイルに保存
     all_text = rt.get_all_text()
     if all_text:
         output_path.write_text(all_text, encoding="utf-8")
         print(f"\nSaved to: {output_path}")
 
 
-def cmd_devices(args):
-    """List available audio devices."""
+def cmd_devices(args: argparse.Namespace) -> None:
+    """利用可能なオーディオ入力デバイスを一覧表示する"""
     devices = MicrophoneRecorder.list_devices()
     print("\nAvailable input devices:\n")
     for d in devices:
@@ -137,7 +145,8 @@ def cmd_devices(args):
     print()
 
 
-def main():
+def main() -> None:
+    # CLIのメインエントリーポイント（サブコマンドのディスパッチ）
     parser = argparse.ArgumentParser(
         prog="mojiokoshi",
         description="Audio transcription CLI tool using Whisper",

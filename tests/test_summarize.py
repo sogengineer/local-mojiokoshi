@@ -1,9 +1,12 @@
 """Tests for summarize module."""
 
 import json
+import urllib.error
 import pytest
 from unittest.mock import patch, MagicMock
 from mojiokoshi.summarize import (
+    call_ollama,
+    correct_chunk,
     summarize,
     to_markdown,
     MeetingNotes,
@@ -181,6 +184,117 @@ class TestSummarize:
         assert second_payload["model"] == "qwen3:14b"
 
 
+class TestCallOllama:
+    """Tests for call_ollama function."""
+
+    @patch("mojiokoshi.summarize.urllib.request.urlopen")
+    def test_call_ollama_success(self, mock_urlopen):
+        """Test successful API call."""
+        mock_response = MagicMock()
+        mock_response.read.return_value = json.dumps(
+            {"message": {"content": "response text"}}
+        ).encode("utf-8")
+        mock_response.__enter__ = MagicMock(return_value=mock_response)
+        mock_response.__exit__ = MagicMock(return_value=False)
+        mock_urlopen.return_value = mock_response
+
+        result = call_ollama([{"role": "user", "content": "test"}], "test-model")
+        assert result == "response text"
+
+    @patch("mojiokoshi.summarize.urllib.request.urlopen")
+    def test_call_ollama_empty_response_raises(self, mock_urlopen):
+        """Test that empty response content raises ValueError."""
+        mock_response = MagicMock()
+        mock_response.read.return_value = json.dumps(
+            {"message": {"content": ""}}
+        ).encode("utf-8")
+        mock_response.__enter__ = MagicMock(return_value=mock_response)
+        mock_response.__exit__ = MagicMock(return_value=False)
+        mock_urlopen.return_value = mock_response
+
+        with pytest.raises(ValueError, match="empty response"):
+            call_ollama([{"role": "user", "content": "test"}], "test-model")
+
+    @patch("mojiokoshi.summarize.urllib.request.urlopen")
+    def test_call_ollama_retry_on_url_error(self, mock_urlopen):
+        """Test retry on URLError then success."""
+        success_response = MagicMock()
+        success_response.read.return_value = json.dumps(
+            {"message": {"content": "ok"}}
+        ).encode("utf-8")
+        success_response.__enter__ = MagicMock(return_value=success_response)
+        success_response.__exit__ = MagicMock(return_value=False)
+
+        mock_urlopen.side_effect = [
+            urllib.error.URLError("connection refused"),
+            success_response,
+        ]
+
+        result = call_ollama([{"role": "user", "content": "test"}], "test-model")
+        assert result == "ok"
+        assert mock_urlopen.call_count == 2
+
+    @patch("mojiokoshi.summarize.urllib.request.urlopen")
+    def test_call_ollama_raises_after_max_retries(self, mock_urlopen):
+        """Test that URLError is raised after all retries exhausted."""
+        mock_urlopen.side_effect = urllib.error.URLError("connection refused")
+
+        with pytest.raises(urllib.error.URLError):
+            call_ollama([{"role": "user", "content": "test"}], "test-model")
+        assert mock_urlopen.call_count == 2  # MAX_RETRIES = 2
+
+    @patch("mojiokoshi.summarize.urllib.request.urlopen")
+    def test_call_ollama_retry_on_json_decode_error(self, mock_urlopen):
+        """Test retry on JSONDecodeError then success."""
+        success_response = MagicMock()
+        success_response.read.return_value = json.dumps(
+            {"message": {"content": "ok"}}
+        ).encode("utf-8")
+        success_response.__enter__ = MagicMock(return_value=success_response)
+        success_response.__exit__ = MagicMock(return_value=False)
+
+        bad_response = MagicMock()
+        bad_response.read.return_value = b"not valid json"
+        bad_response.__enter__ = MagicMock(return_value=bad_response)
+        bad_response.__exit__ = MagicMock(return_value=False)
+
+        mock_urlopen.side_effect = [bad_response, success_response]
+
+        result = call_ollama([{"role": "user", "content": "test"}], "test-model")
+        assert result == "ok"
+        assert mock_urlopen.call_count == 2
+
+
+class TestCorrectChunk:
+    """Tests for correct_chunk function."""
+
+    @patch("mojiokoshi.summarize.call_ollama")
+    def test_correct_chunk_with_context(self, mock_call):
+        """Test correction with context."""
+        mock_call.return_value = json.dumps({"corrected_text": "修正済み"})
+        result = correct_chunk("前の文脈", "メインテキスト", "test-model")
+        assert result == "修正済み"
+        # Verify context is included in the prompt
+        call_args = mock_call.call_args[0][0]  # messages
+        assert "前の文脈" in call_args[1]["content"]
+
+    @patch("mojiokoshi.summarize.call_ollama")
+    def test_correct_chunk_without_context(self, mock_call):
+        """Test correction without context."""
+        mock_call.return_value = json.dumps({"corrected_text": "修正済み"})
+        result = correct_chunk("", "メインテキスト", "test-model")
+        assert result == "修正済み"
+        call_args = mock_call.call_args[0][0]
+        assert "前の文脈" not in call_args[1]["content"]
+
+    @patch("mojiokoshi.summarize.call_ollama")
+    def test_correct_chunk_missing_key_fallback(self, mock_call):
+        """Test fallback when corrected_text key is missing."""
+        mock_call.return_value = json.dumps({"wrong_key": "value"})
+        result = correct_chunk("", "元のテキスト", "test-model")
+        assert result == "元のテキスト"
+
+
 class TestChunking:
     """Tests for text chunking functionality."""
 
@@ -207,6 +321,31 @@ class TestChunking:
         # Second chunk has context from first
         assert chunks[1][0] == "の文脈メ"  # context
         assert chunks[1][1] == "イン部分"  # main text
+
+
+class TestSummarizeMain:
+    """Tests for summarize CLI main function."""
+
+    def test_main_file_not_found(self):
+        """Test main exits with error when file not found."""
+        from mojiokoshi.summarize import main as summarize_main
+
+        with patch("sys.argv", ["summarize", "/nonexistent/file.txt"]):
+            with pytest.raises(SystemExit) as exc_info:
+                summarize_main()
+            assert exc_info.value.code == 1
+
+    def test_main_empty_file(self, tmp_path):
+        """Test main exits with error when file is empty."""
+        from mojiokoshi.summarize import main as summarize_main
+
+        empty_file = tmp_path / "empty.txt"
+        empty_file.write_text("", encoding="utf-8")
+
+        with patch("sys.argv", ["summarize", str(empty_file)]):
+            with pytest.raises(SystemExit) as exc_info:
+                summarize_main()
+            assert exc_info.value.code == 1
 
 
 class TestPrompts:

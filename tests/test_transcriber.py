@@ -37,6 +37,12 @@ class TestWhisperTranscriber:
         with pytest.raises(KeyError):
             WhisperTranscriber(model_name="invalid")
 
+    def test_transcribe_nonexistent_file_raises_error(self):
+        """Test that transcribing a non-existent file raises FileNotFoundError."""
+        transcriber = WhisperTranscriber()
+        with pytest.raises(FileNotFoundError, match="Audio file not found"):
+            transcriber.transcribe("/nonexistent/audio.wav")
+
 
 class TestTranscriptionResult:
     """Tests for TranscriptionResult dataclass."""
